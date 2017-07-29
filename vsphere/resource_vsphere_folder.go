@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/hashicorp/terraform/helper/schema"
@@ -72,44 +73,47 @@ func resourceVSphereFolderCreate(d *schema.ResourceData, meta interface{}) error
 
 func createFolder(client *govmomi.Client, f *folder) error {
 
-	finder := find.NewFinder(client.Client, true)
+	finder := find.NewFinder(client.Client, false)
 
-	dc, err := finder.Datacenter(context.TODO(), f.datacenter)
+	dc, err := finder.DatacenterOrDefault(context.Background(), f.datacenter)
 	if err != nil {
 		return fmt.Errorf("error %s", err)
 	}
 	finder = finder.SetDatacenter(dc)
 	si := object.NewSearchIndex(client.Client)
+	base := filepath.Join(dc.InventoryPath, "vm")
+	path := filepath.ToSlash(filepath.Join(base, f.path))
 
-	dcFolders, err := dc.Folders(context.TODO())
-	if err != nil {
-		return fmt.Errorf("error %s", err)
-	}
+	var folders []string
+	var ref object.Reference
 
-	folder := dcFolders.VmFolder
-	var workingPath string
-
-	pathParts := strings.Split(f.path, "/")
-	for _, pathPart := range pathParts {
-		if len(workingPath) > 0 {
-			workingPath += "/"
-		}
-		workingPath += pathPart
-		subfolder, err := si.FindByInventoryPath(
-			context.TODO(), fmt.Sprintf("%v/vm/%v", f.datacenter, workingPath))
-
+	// We iterate over the path starting with full path
+	// If we don't find it, we save the folder name and continue with the previous path
+	// The iteration ends when we find an existing path otherwise it throws error
+	for {
+		ref, err = si.FindByInventoryPath(context.Background(), path)
 		if err != nil {
 			return fmt.Errorf("error %s", err)
-		} else if subfolder == nil {
-			log.Printf("[DEBUG] folder not found; creating: %s", workingPath)
-			folder, err = folder.CreateFolder(context.TODO(), pathPart)
-			if err != nil {
-				return fmt.Errorf("Failed to create folder at %s; %s", workingPath, err)
+		}
+		if ref == nil {
+			_, folder := filepath.Split(path)
+			folders = append(folders, folder)
+			path = path[:strings.LastIndex(path, "/")]
+
+			if path == dc.InventoryPath {
+				return fmt.Errorf("vSphere base path %s not found", filepath.ToSlash(base))
 			}
 		} else {
-			log.Printf("[DEBUG] folder already exists: %s", workingPath)
-			f.existingPath = workingPath
-			folder = subfolder.(*object.Folder)
+			break
+		}
+	}
+
+	root := ref.(*object.Folder)
+	for i := len(folders) - 1; i >= 0; i-- {
+		log.Printf("[DEBUG] folder not found; creating: %s", folders[i])
+		root, err = root.CreateFolder(context.Background(), folders[i])
+		if err != nil {
+			return fmt.Errorf("Failed to create folder at %s; %s", root.InventoryPath, err)
 		}
 	}
 	return nil
